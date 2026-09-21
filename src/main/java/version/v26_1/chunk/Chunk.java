@@ -50,6 +50,7 @@ public class Chunk extends ChunkEntities implements IChunk {
     private Runnable onUnload;
     private boolean isNewChunk;
     private boolean saved;
+    private boolean parsed;
     private ChunkImageFactory imageFactory;
 
     public ChunkHeightHandler getChunkHeightHandler() {
@@ -141,7 +142,7 @@ public class Chunk extends ChunkEntities implements IChunk {
      * Allows a callback to be called when the chunk is done being parsed.
      */
     public void whenParsed(Runnable r) {
-        if (isSaved()) {
+        if (parsed || isSaved()) {
             r.run();
         } else {
             afterParse = r;
@@ -597,6 +598,7 @@ public class Chunk extends ChunkEntities implements IChunk {
     protected void afterParse() {
         // ensure the chunk is (re)saved
         this.saved = false;
+        this.parsed = true;
 
         // run the callback if one exists
         if (afterParse != null) {
@@ -626,9 +628,18 @@ public class Chunk extends ChunkEntities implements IChunk {
 
         tag.asCompound().get("sections").asList().forEach(section -> {
             int sectionY = section.get("Y").byteValue();
-            setChunkSection(sectionY, parseSection(sectionY, section));
+            // Only fill in sections this chunk doesn't have yet. Region.addChunk()
+            // merges on-disk data into a chunk that was already parsed from the
+            // network, and the fresh data must win over whatever is stored in the
+            // region file.
+            if (getChunkSection(sectionY) == null) {
+                setChunkSection(sectionY, parseSection(sectionY, section));
+            }
         });
-        parseHeightMaps(tag);
+        if (heightMap == null) {
+            parseHeightMaps(tag);
+        }
+        this.parsed = true;
     }
 
     protected void parseHeightMaps(Tag tag) {

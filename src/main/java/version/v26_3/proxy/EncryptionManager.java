@@ -1,0 +1,457 @@
+package version.v26_3.proxy;
+
+import core.auth.ClientAuthenticator;
+import core.auth.ServerAuthenticator;
+import core.config.Config;
+import core.interfaces.IEncryptionManager;
+import core.messages.Messages;
+import core.proxy.ConnectionDetails;
+import core.proxy.IExceptionHandler;
+import core.queue.ByteQueue;
+import version.v26_3.packets.builder.PacketBuilder;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.security.interfaces.RSAPublicKey;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.UnaryOperator;
+
+import static core.util.PrintUtils.devPrintFormat;
+
+/**
+ * Class to handle encryption, decryption and related masking of the proxy server.
+ */
+public class EncryptionManager implements IEncryptionManager {
+    private static final String ENCRYPTION_TYPE = "AES/CFB8/NoPadding";
+    private final PacketInjector packetInjector;
+    private boolean encryptionEnabled = false;
+    private String serverId;
+    private RSAPublicKey serverRealPublicKey;
+    private byte[] nonce;
+    private byte[] clientSharedSecret;
+    private Cipher clientBoundDecryptor, clientBoundEncryptor, serverBoundEncryptor, serverBoundDecryptor;
+    private OutputStream streamToClient;
+    private OutputStream streamToServer;
+    private KeyPair serverKeyPair;
+    private KeyPair clientProfileKeyPair;
+    private String username;
+
+    private final CompressionManager compressionManager;
+    private final ClientAuthenticator clientAuthenticator;
+
+    private RSAPublicKey clientProfilePublicKey;
+    private boolean shouldAuthenticate = true; /* >= 1.20.6 */
+
+    {
+        // generate the keypair for the local server
+        attempt(() -> {
+            KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
+            keyGen.initialize(1024);
+            serverKeyPair = keyGen.generateKeyPair();
+        });
+    }
+
+    public EncryptionManager(CompressionManager compressionManager) {
+        this.compressionManager = compressionManager;
+        this.packetInjector = new PacketInjector(compressionManager);
+        this.clientAuthenticator = new ClientAuthenticator();
+    }
+
+    public boolean isEncryptionEnabled() {
+        return encryptionEnabled;
+    }
+
+    public void setServerEncryptionRequest(byte[] encoded, byte[] nonce, String serverId, boolean shouldAuthenticate) {
+        this.shouldAuthenticate = shouldAuthenticate;
+        setServerEncryptionRequest(encoded, nonce, serverId);
+    }
+    /**
+     * When the server sends the client an encryption request, this method will be called to get the server's given
+     * public key and call the replacement request sender.
+     * @param encoded  the encoded public key in X509
+     * @param nonce    the server's verification token
+     * @param serverId the server's id (not actually used)
+     */
+    public void setServerEncryptionRequest(byte[] encoded, byte[] nonce, String serverId) {
+        attempt(() -> {
+            this.nonce = nonce;
+            this.serverId = serverId;
+
+            KeyFactory kf = KeyFactory.getInstance("RSA");
+            serverRealPublicKey = (RSAPublicKey) kf.generatePublic(new X509EncodedKeySpec(encoded));
+
+            sendReplacementEncryptionRequest();
+        });
+    }
+
+    /**
+     * Simple method to make exception handling cleaner.
+     */
+    private static void attempt(IExceptionHandler r) {
+        try {
+            r.run();
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            System.out.println(Messages.console("console.proxy.encryption_failure"));
+            System.exit(1);
+        }
+    }
+
+    /**
+     * Simple method to make exception handling cleaner.
+     */
+    private boolean disconnectOnError(IExceptionHandler r) {
+        try {
+            r.run();
+        } catch (Exception ex) {
+            ex.printStackTrace();
+
+            attempt(() -> streamToServer.close());
+            attempt(() -> streamToClient.close());
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * This method will send the client a self-generated public key in an encryption request. This way we will be able
+     * to decrypt the client's shared secret key later on and use this to decrypt all the traffic.
+     */
+    private void sendReplacementEncryptionRequest() {
+        PacketBuilder builder = new PacketBuilder(0x01);
+
+        byte[] encoded = serverKeyPair.getPublic().getEncoded();
+        builder.writeString(serverId);    // server ID
+        builder.writeVarInt(encoded.length); // pub key len
+        builder.writeByteArray(encoded); // pub key
+        builder.writeVarInt(nonce.length); // verify token len
+        builder.writeByteArray(nonce);  // verify token
+
+        // 1.20.6+ includes an explicit "should authenticate" boolean in the Hello packet.
+        builder.writeBoolean(shouldAuthenticate);
+
+        attempt(() -> streamToClient(builder.build()));
+    }
+
+    /**
+     * Method to stream a given queue of bytes to the client. Whenever this is called it also checks whether we have
+     * any injected packets queued to be sent to the client.
+     * @param bytes the bytes to stream
+     */
+    public synchronized void streamToClient(ByteQueue bytes) throws IOException {
+        streamTo(streamToClient, bytes, this::clientBoundEncrypt);
+
+        // if we need to insert packets, send at most 100 at a time
+        int limit = 100;
+        while (packetInjector.hasNext() && limit > 0) {
+            limit--;
+            streamTo(streamToClient, packetInjector.getNext(), this::clientBoundEncrypt);
+        }
+
+    }
+
+    /**
+     * Send a batch of packets directly to the client in one burst, bypassing the injector
+     * queue. Used by the selection particle renderer so all particles appear simultaneously
+     * instead of being throttled by the 100-packet-per-flush limit in {@link #streamToClient}.
+     */
+    public synchronized void streamToClientBatch(List<PacketBuilder> builders) throws IOException {
+        for (PacketBuilder pb : builders) {
+            streamTo(streamToClient, pb.build(compressionManager), this::clientBoundEncrypt);
+        }
+    }
+
+    /**
+     * Send a single packet directly to the client immediately, bypassing the injector queue.
+     * Used for packets that must reach the client right away (e.g. spectator mode toggle).
+     */
+    public synchronized void streamToClientDirect(PacketBuilder pb) throws IOException {
+        streamTo(streamToClient, pb.build(compressionManager), this::clientBoundEncrypt);
+    }
+
+    /**
+     * Method to stream a queue of bytes to a given output stream. The stream will be encrypted if encryption has been
+     * enabled.
+     * @param stream  the stream to write to
+     * @param bytes   the bytes to write
+     * @param encrypt the encryption operator
+     */
+    private void streamTo(OutputStream stream, ByteQueue bytes, UnaryOperator<byte[]> encrypt) throws IOException {
+        byte[] b = bytes.toArray();
+
+        byte[] encrypted = encrypt.apply(b);
+
+        stream.write(encrypted, 0, encrypted.length);
+        stream.flush();
+    }
+
+    /**
+     * Encrypts a given byte array using the encryption stream for the client-side.
+     */
+    private byte[] clientBoundEncrypt(byte[] bytes) {
+        return encrypt(bytes, clientBoundEncryptor);
+    }
+
+    /**
+     * Encrypts a given byte array using the the given encryptor, if encryption has been enabled.
+     */
+    private byte[] encrypt(byte[] bytes, Cipher encryptor) {
+        if (!encryptionEnabled) { return bytes; }
+
+        try {
+            return encryptor.update(bytes);
+        } catch (Exception ex) {
+            throw new RuntimeException("Could not encrypt stream!", ex);
+        }
+    }
+
+    /**
+     * Called to intercept the client's encryption confirmation. Because we intercepted the server's real public key,
+     * we need to now decrypt the given shared secret key (and token) and re-encrypt it using the real public key.
+     * Through this method we can learn the shared secret key.
+     * @param encryptedSharedSecret the encrypted shared secret key
+     * @param token                 the verification token
+     */
+    public void setClientEncryptionConfirmation(byte[] encryptedSharedSecret, byte[] token) {
+        attempt(() -> {
+            Cipher cipher = Cipher.getInstance("RSA");
+            cipher.init(Cipher.DECRYPT_MODE, serverKeyPair.getPrivate());
+            byte[] decryptedToken = cipher.doFinal(token);
+
+            if (!Arrays.equals(decryptedToken, nonce)) {
+                throw new RuntimeException("Token could not be verified!");
+            }
+
+            clientSharedSecret = cipher.doFinal(encryptedSharedSecret);
+
+            sendReplacementEncryptionConfirmation();
+        });
+    }
+
+
+    /**
+     * This method first authenticates with the Mojang servers, then sends the server a replacement encryption
+     * confirmation message. This confirmation will include the client's real shared secret but it will be encrypted
+     * using the server's real public key instead of our own. After this, encryption will be enabled for all
+     * future traffic.
+     */
+    private void sendReplacementEncryptionConfirmation() {
+        if (shouldAuthenticate) {
+            // authenticate the client so that the remote server will accept us
+            boolean client = disconnectOnError(() -> clientAuthenticator.makeRequest(generateServerHash()));
+            if (!client) { return; }
+
+            // verify the connecting client connection is who they claim to be
+            boolean server = disconnectOnError(() -> new ServerAuthenticator(username).makeRequest(generateServerHash()));
+            if (!server) { return; }
+        }
+
+        // encryption confirmation
+        attempt(() -> {
+            PacketBuilder builder = new PacketBuilder(0x01);
+
+            Cipher cipher = Cipher.getInstance("RSA");
+            cipher.init(Cipher.ENCRYPT_MODE, serverRealPublicKey);
+            byte[] sharedSecret = cipher.doFinal(clientSharedSecret);
+            byte[] verifyToken = cipher.doFinal(nonce);
+
+            builder.writeVarInt(sharedSecret.length);
+            builder.writeByteArray(sharedSecret);
+            builder.writeVarInt(verifyToken.length);
+            builder.writeByteArray(verifyToken);
+
+            streamToServer(builder.build());
+
+            enableEncryption();
+        });
+    }
+
+    /**
+     * Generate the server hash to be used for the Mojang session server.
+     * @return the generated hash. See https://wiki.vg/Protocol
+     */
+    private String generateServerHash() {
+        AtomicReference<MessageDigest> sha1 = new AtomicReference<>();
+        attempt(() -> sha1.set(MessageDigest.getInstance("SHA1")));
+
+        sha1.get().update(serverId.getBytes(StandardCharsets.US_ASCII));
+        sha1.get().update(clientSharedSecret);
+        sha1.get().update(serverRealPublicKey.getEncoded());
+
+        return new BigInteger(sha1.get().digest()).toString(16);
+    }
+
+    public void streamToServer(ByteQueue bytes) throws IOException {
+        // System.out.println("Writing bytes to server: " + bytes.size() + " :: " + bytes);
+        streamTo(streamToServer, bytes, this::serverBoundEncrypt);
+    }
+
+    /**
+     * Convenience method: build a PacketBuilder with compression and send it to the server.
+     */
+    public void streamToServer(PacketBuilder builder) throws IOException {
+        streamToServer(builder.build(compressionManager));
+    }
+
+    /**
+     * Enable encryption for all future packets. We need to create four cyphers: a decryptor and encryptor for the
+     * client-bound packets, and a decryptor and encryptor for the server-bound packets. As the cypher is continuous
+     * and not per-packet we cannot re-use the streams between the client and server despite them having the same key.
+     */
+    private void enableEncryption() {
+        attempt(() -> {
+            IvParameterSpec ivspec = new IvParameterSpec(clientSharedSecret);
+            SecretKeySpec k = new SecretKeySpec(clientSharedSecret, "AES");
+            clientBoundEncryptor = Cipher.getInstance(ENCRYPTION_TYPE);
+            clientBoundEncryptor.init(Cipher.ENCRYPT_MODE, k, ivspec);
+
+            clientBoundDecryptor = Cipher.getInstance(ENCRYPTION_TYPE);
+            clientBoundDecryptor.init(Cipher.DECRYPT_MODE, k, ivspec);
+
+            serverBoundEncryptor = Cipher.getInstance(ENCRYPTION_TYPE);
+            serverBoundEncryptor.init(Cipher.ENCRYPT_MODE, k, ivspec);
+
+            serverBoundDecryptor = Cipher.getInstance(ENCRYPTION_TYPE);
+            serverBoundDecryptor.init(Cipher.DECRYPT_MODE, k, ivspec);
+
+            encryptionEnabled = true;
+        });
+    }
+
+    private byte[] serverBoundEncrypt(byte[] bytes) {
+        return encrypt(bytes, serverBoundEncryptor);
+    }
+
+    public void setStreamToClient(OutputStream streamToClient) {
+        this.streamToClient = streamToClient;
+    }
+
+    public void setStreamToServer(OutputStream streamToServer) {
+        this.streamToServer = streamToServer;
+    }
+
+    public byte[] serverBoundDecrypt(byte[] bytes) {
+        return decrypt(bytes, serverBoundDecryptor);
+    }
+
+    private byte[] decrypt(byte[] bytes, Cipher decryptor) {
+        if (!encryptionEnabled) { return bytes; }
+
+        try {
+            return decryptor.update(bytes);
+        } catch (Exception e) {
+            e.printStackTrace();
+            System.exit(1);
+        }
+        return null;
+    }
+
+    public byte[] clientBoundDecrypt(byte[] bytes) {
+        return decrypt(bytes, clientBoundDecryptor);
+    }
+
+    public void reset() {
+        encryptionEnabled = false;
+        this.packetInjector.clear();
+        clientAuthenticator.reset();
+    }
+
+    /**
+     * Send a masked handshake packet to the client. We will intercept the real one as it has the hostname and port of
+     * our proxy instead of the ones from the real server. Vanilla clients will accept this but some servers verify
+     * the hostname before allowing a connection.
+     * @param protocolVersion the version of the connection protocol
+     * @param nextMode        the next connection mode (login or status)
+     * @param hostExtension   additional text to add to the end of the host, primarily for Forge
+     */
+    public void sendMaskedHandshake(int protocolVersion, int nextMode, String hostExtension) {
+        attempt(() -> {
+            ConnectionDetails connectionDetails = Config.getConnectionDetails();
+            PacketBuilder builder = new PacketBuilder(0);
+
+            builder.writeVarInt(protocolVersion);
+            builder.writeString(connectionDetails.getHost() + hostExtension);
+            builder.writeShort(connectionDetails.getPortRemote());
+            builder.writeVarInt(nextMode);
+
+            devPrintFormat(
+                    "Performed handshake with %s:%d, protocol version %d\n",
+                    connectionDetails.getHost(),
+                    connectionDetails.getPortRemote(),
+                    protocolVersion
+            );
+
+            streamToServer(builder.build());
+        });
+    }
+    public void setUsername(String username) {
+        this.username = username;
+    }
+
+    public void sendImmediately(PacketBuilder builder) {
+        attempt(() -> streamToClient(builder.build(compressionManager)));
+    }
+
+    public void setClientProfilePublicKey(byte[] arr) {
+        attempt(() -> {
+            X509EncodedKeySpec spec = new X509EncodedKeySpec(arr);
+            KeyFactory kf = KeyFactory.getInstance("RSA");
+            clientProfilePublicKey = (RSAPublicKey) kf.generatePublic(spec);
+        });
+    }
+
+    public void setClientProfileSignature(byte[] readByteArray) {
+
+    }
+
+    public void setClientProfileKeyPair(String privateKey, String publicKey) {
+        attempt(() -> {
+            PKCS8EncodedKeySpec specPrivate = new PKCS8EncodedKeySpec(toBytes(privateKey));
+            X509EncodedKeySpec specPublic = new X509EncodedKeySpec(toBytes(publicKey));
+            KeyFactory kf = KeyFactory.getInstance("RSA");
+            PrivateKey keyPrivate = kf.generatePrivate(specPrivate);
+            PublicKey keyPublic = kf.generatePublic(specPublic);
+
+            this.clientProfileKeyPair = new KeyPair(keyPublic, keyPrivate);
+
+            if (!clientProfilePublicKey.equals(keyPublic)) {
+                System.err.println(Messages.console("console.proxy.key_mismatch"));
+            }
+        });
+    }
+
+    /**
+     * Gets the Base64 encoded part of an encoded public/private key as a byte[].
+     */
+    private static byte[] toBytes(String key) {
+        String prefixPub = "-----BEGIN PUBLIC KEY-----\n";
+        String prefixPriv = "-----BEGIN PRIVATE KEY-----\n";
+        String suffixPub = "\n-----END PUBLIC KEY-----";
+        String suffixPriv = "\n-----END PRIVATE KEY-----";
+        String trimmed = key
+            .replace(prefixPub, "")
+            .replace(prefixPriv, "")
+            .replace(suffixPriv, "")
+            .replace(suffixPub, "")
+            .replace("\n", "")
+            .strip();
+
+        return Base64.getDecoder().decode(trimmed);
+    }
+
+    public PacketInjector getPacketInjector() {
+        return packetInjector;
+    }
+}
+

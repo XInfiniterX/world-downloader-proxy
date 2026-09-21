@@ -27,7 +27,7 @@ import java.util.Collections;
 import java.util.Objects;
 
 public class Config {
-    private static final int DEFAULT_VERSION = Version.V26_2.protocolVersion;
+    private static final int DEFAULT_VERSION = Version.V26_3.protocolVersion;
     private static Path configPath;
 
     private static Object injector;

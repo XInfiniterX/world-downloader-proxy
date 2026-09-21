@@ -1,0 +1,38 @@
+package version.v26_3.villagers;
+
+import com.google.gson.Gson;
+import version.v26_3.registries.RegistriesJson;
+
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.util.HashMap;
+import java.util.Map;
+
+public class VillagerTypeRegistry {
+
+    private Map<Integer, String> types;
+
+    public static VillagerTypeRegistry fromRegistry(InputStream input) {
+        if (input == null) {
+            return new VillagerTypeRegistry();
+        }
+
+        RegistriesJson map = new Gson().fromJson(new InputStreamReader(input), RegistriesJson.class);
+
+        // convert JSON structure into protocol_id->name map
+        VillagerTypeRegistry villagerTypeRegistry = new VillagerTypeRegistry();
+        map.get("minecraft:villager_type").getEntries()
+                .forEach((name, properties) -> villagerTypeRegistry.types.put(properties.get("protocol_id"), name));
+
+        return villagerTypeRegistry;
+    }
+
+    public VillagerTypeRegistry() {
+        types = new HashMap<>();
+    }
+
+    public String getType(int id) {
+        return types.getOrDefault(id, "minecraft:none");
+    }
+
+}

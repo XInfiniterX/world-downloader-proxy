@@ -1,0 +1,52 @@
+package version.v26_3.chunk.palette;
+
+import se.llbit.nbt.SpecificTag;
+import version.v26_3.packets.builder.PacketBuilder;
+
+import java.util.List;
+
+public class DirectPalette extends Palette {
+    private final int bitsPerBlock;
+
+    public DirectPalette() {
+        this(GlobalPaletteProvider.getGlobalPalette().getRequiredBits());
+    }
+
+    public DirectPalette(int bitsPerBlock) {
+        super();
+
+        this.bitsPerBlock = bitsPerBlock;
+    }
+
+    @Override
+    public int stateFromId(int index) {
+        return index;
+    }
+
+    @Override
+    public int getBitsPerBlock() {
+        return bitsPerBlock;
+    }
+
+    @Override
+    public boolean isEmpty() {
+        return false;
+    }
+
+    @Override
+    public List<SpecificTag> toNbt() {
+        return List.of();
+    }
+
+    @Override
+    public void write(PacketBuilder packet) {
+        packet.writeByte((byte) bitsPerBlock);
+    }
+
+    @Override
+    public String toString() {
+        return "DirectPalette{" +
+                "bitsPerBlock=" + bitsPerBlock +
+                '}';
+    }
+}
